@@ -7,11 +7,23 @@ type NoiseEvent = {
   durationSeconds: number
   averageDb: number
   peakDb: number
+  burstCount: number
+}
+
+type ActiveEvent = {
+  startMs: number
+  aboveThresholdSamples: number[]
+  peakDb: number
+  burstCount: number
+  inBurst: boolean
+  burstAboveStartMs: number | null
+  belowThresholdStartMs: number | null
 }
 
 const STORAGE_KEY = 'noise-log-events-v1'
-const MIN_EVENT_SECONDS = 3
-const DEFAULT_THRESHOLD = 70
+const BURST_MIN_SECONDS = 0.5
+const SILENCE_GAP_SECONDS = 2
+const DEFAULT_THRESHOLD = 55
 
 const formatDateTime = (iso: string) =>
   new Date(iso).toLocaleString([], {
@@ -31,13 +43,22 @@ const formatDuration = (seconds: number) => {
 }
 
 const toCsv = (events: NoiseEvent[]) => {
-  const header = ['start_time', 'end_time', 'duration_seconds', 'average_db', 'peak_db']
+  const header = [
+    'start_time',
+    'end_time',
+    'duration_seconds',
+    'average_db_above_threshold',
+    'peak_db',
+    'burst_count'
+  ]
+
   const rows = events.map((event) => [
     event.startTime,
     event.endTime,
     event.durationSeconds.toFixed(2),
     event.averageDb.toFixed(1),
-    event.peakDb.toFixed(1)
+    event.peakDb.toFixed(1),
+    event.burstCount
   ])
 
   return [header, ...rows]
@@ -57,8 +78,8 @@ function App() {
   const mediaStreamRef = useRef<MediaStream | null>(null)
   const rafRef = useRef<number | null>(null)
 
-  const aboveThresholdStartRef = useRef<number | null>(null)
-  const currentEventRef = useRef<{ startMs: number; dbSamples: number[]; peakDb: number } | null>(null)
+  const initialBurstStartRef = useRef<number | null>(null)
+  const currentEventRef = useRef<ActiveEvent | null>(null)
 
   useEffect(() => {
     const saved = localStorage.getItem(STORAGE_KEY)
@@ -66,9 +87,11 @@ function App() {
 
     try {
       const parsed = JSON.parse(saved) as NoiseEvent[]
-      if (Array.isArray(parsed)) setEvents(parsed)
+      if (Array.isArray(parsed)) {
+        setEvents(parsed)
+      }
     } catch {
-      // Ignore malformed local storage payloads.
+      // Ignore malformed storage payloads.
     }
   }, [])
 
@@ -89,33 +112,44 @@ function App() {
   }, [events])
 
   const summary = useMemo(() => {
+    const emptyByHour = Array.from({ length: 24 }, (_, hour) => ({ hour, events: 0, bursts: 0 }))
+
     if (!todayEvents.length) {
       return {
         totalEvents: 0,
+        totalBursts: 0,
         averageDb: 0,
         peakDb: 0,
-        byHour: Array.from({ length: 24 }, (_, hour) => ({ hour, count: 0 }))
+        byHour: emptyByHour
       }
     }
 
     const totalEvents = todayEvents.length
+    const totalBursts = todayEvents.reduce((acc, event) => acc + event.burstCount, 0)
     const averageDb =
-      todayEvents.reduce((acc, event) => acc + event.averageDb, 0) / totalEvents
+      todayEvents.reduce((acc, event) => acc + event.averageDb, 0) / Math.max(totalEvents, 1)
     const peakDb = Math.max(...todayEvents.map((event) => event.peakDb))
 
-    const hourCounts = new Array(24).fill(0)
+    const byHour = emptyByHour.map((item) => ({ ...item }))
     todayEvents.forEach((event) => {
       const hour = new Date(event.startTime).getHours()
-      hourCounts[hour] += 1
+      byHour[hour].events += 1
+      byHour[hour].bursts += event.burstCount
     })
 
     return {
       totalEvents,
+      totalBursts,
       averageDb,
       peakDb,
-      byHour: hourCounts.map((count, hour) => ({ hour, count }))
+      byHour
     }
   }, [todayEvents])
+
+  const resetRuntimeState = () => {
+    initialBurstStartRef.current = null
+    currentEventRef.current = null
+  }
 
   const stopMonitoring = () => {
     setIsMonitoring(false)
@@ -135,35 +169,42 @@ function App() {
     }
     audioContextRef.current = null
 
-    aboveThresholdStartRef.current = null
-    currentEventRef.current = null
+    resetRuntimeState()
   }
 
-  const finalizeEvent = (endMs: number) => {
-    const active = currentEventRef.current
-    if (!active) return
-
-    const durationSeconds = (endMs - active.startMs) / 1000
-    const qualifies = durationSeconds >= MIN_EVENT_SECONDS
-
-    if (qualifies && active.dbSamples.length > 0) {
-      const averageDb =
-        active.dbSamples.reduce((acc, sample) => acc + sample, 0) / active.dbSamples.length
-
-      const newEvent: NoiseEvent = {
-        id: crypto.randomUUID(),
-        startTime: new Date(active.startMs).toISOString(),
-        endTime: new Date(endMs).toISOString(),
-        durationSeconds,
-        averageDb,
-        peakDb: active.peakDb
-      }
-
-      setEvents((prev) => [newEvent, ...prev])
+  const finalizeEvent = (eventData: ActiveEvent, endMs: number) => {
+    const durationSeconds = Math.max(0, (endMs - eventData.startMs) / 1000)
+    if (durationSeconds <= 0 || eventData.burstCount === 0 || !eventData.aboveThresholdSamples.length) {
+      return
     }
 
-    currentEventRef.current = null
-    aboveThresholdStartRef.current = null
+    const averageDb =
+      eventData.aboveThresholdSamples.reduce((acc, sample) => acc + sample, 0) /
+      eventData.aboveThresholdSamples.length
+
+    const newEvent: NoiseEvent = {
+      id: crypto.randomUUID(),
+      startTime: new Date(eventData.startMs).toISOString(),
+      endTime: new Date(endMs).toISOString(),
+      durationSeconds,
+      averageDb,
+      peakDb: eventData.peakDb,
+      burstCount: eventData.burstCount
+    }
+
+    setEvents((prev) => [newEvent, ...prev])
+  }
+
+  const startGroupedEvent = (startMs: number, initialDb: number) => {
+    currentEventRef.current = {
+      startMs,
+      aboveThresholdSamples: [initialDb],
+      peakDb: initialDb,
+      burstCount: 1,
+      inBurst: true,
+      burstAboveStartMs: null,
+      belowThresholdStartMs: null
+    }
   }
 
   const tick = () => {
@@ -184,30 +225,68 @@ function App() {
     setCurrentDb(estimatedDb)
 
     const now = Date.now()
+    const isAboveThreshold = estimatedDb >= thresholdDb
+    const active = currentEventRef.current
 
-    if (estimatedDb >= thresholdDb) {
-      if (aboveThresholdStartRef.current === null) {
-        aboveThresholdStartRef.current = now
-      }
-
-      const aboveDurationSeconds = (now - aboveThresholdStartRef.current) / 1000
-      if (aboveDurationSeconds >= MIN_EVENT_SECONDS) {
-        if (!currentEventRef.current) {
-          currentEventRef.current = {
-            startMs: aboveThresholdStartRef.current,
-            dbSamples: [],
-            peakDb: estimatedDb
-          }
+    if (!active) {
+      if (isAboveThreshold) {
+        if (initialBurstStartRef.current === null) {
+          initialBurstStartRef.current = now
         }
 
-        currentEventRef.current.dbSamples.push(estimatedDb)
-        currentEventRef.current.peakDb = Math.max(currentEventRef.current.peakDb, estimatedDb)
+        const aboveSeconds = (now - initialBurstStartRef.current) / 1000
+        if (aboveSeconds >= BURST_MIN_SECONDS) {
+          startGroupedEvent(initialBurstStartRef.current, estimatedDb)
+          initialBurstStartRef.current = null
+        }
+      } else {
+        initialBurstStartRef.current = null
+      }
+
+      rafRef.current = requestAnimationFrame(tick)
+      return
+    }
+
+    if (isAboveThreshold) {
+      active.belowThresholdStartMs = null
+
+      if (!active.inBurst) {
+        if (active.burstAboveStartMs === null) {
+          active.burstAboveStartMs = now
+        }
+
+        const burstBuildUpSeconds = (now - active.burstAboveStartMs) / 1000
+        if (burstBuildUpSeconds >= BURST_MIN_SECONDS) {
+          active.inBurst = true
+          active.burstCount += 1
+          active.aboveThresholdSamples.push(estimatedDb)
+          active.peakDb = Math.max(active.peakDb, estimatedDb)
+          active.burstAboveStartMs = null
+        }
+      } else {
+        active.aboveThresholdSamples.push(estimatedDb)
+        active.peakDb = Math.max(active.peakDb, estimatedDb)
       }
     } else {
-      if (currentEventRef.current) {
-        finalizeEvent(now)
+      if (active.inBurst) {
+        active.inBurst = false
+        active.burstAboveStartMs = null
+        active.belowThresholdStartMs = now
       } else {
-        aboveThresholdStartRef.current = null
+        if (active.belowThresholdStartMs === null) {
+          active.belowThresholdStartMs = now
+        }
+
+        const silenceSeconds = (now - active.belowThresholdStartMs) / 1000
+        if (silenceSeconds >= SILENCE_GAP_SECONDS) {
+          const endedEvent = currentEventRef.current
+          currentEventRef.current = null
+          initialBurstStartRef.current = null
+
+          if (endedEvent) {
+            finalizeEvent(endedEvent, endedEvent.belowThresholdStartMs ?? now)
+          }
+        }
       }
     }
 
@@ -231,6 +310,7 @@ function App() {
       source.connect(analyser)
       analyserRef.current = analyser
 
+      resetRuntimeState()
       tick()
     } catch {
       setHasPermission(false)
@@ -302,7 +382,10 @@ function App() {
           </p>
         )}
 
-        <p className="subtle">A noise event is logged when sound stays above threshold for 3+ seconds.</p>
+        <p className="subtle">
+          Burst rule: above threshold for {BURST_MIN_SECONDS}s starts a burst. Grouped event closes only
+          after {SILENCE_GAP_SECONDS}s of continuous silence below threshold.
+        </p>
       </section>
 
       <section className="card">
@@ -310,7 +393,11 @@ function App() {
         <div className="summary-grid">
           <div>
             <strong>{summary.totalEvents}</strong>
-            <span>Events</span>
+            <span>Noise events</span>
+          </div>
+          <div>
+            <strong>{summary.totalBursts}</strong>
+            <span>Bursts</span>
           </div>
           <div>
             <strong>{summary.averageDb.toFixed(1)} dB</strong>
@@ -322,12 +409,12 @@ function App() {
           </div>
         </div>
 
-        <h3>Events by Hour</h3>
+        <h3>Events / Bursts by Hour</h3>
         <div className="hours-grid">
-          {summary.byHour.map(({ hour, count }) => (
+          {summary.byHour.map(({ hour, events: eventsCount, bursts }) => (
             <div key={hour} className="hour-item">
               <span>{hour.toString().padStart(2, '0')}:00</span>
-              <strong>{count}</strong>
+              <strong>E:{eventsCount} / B:{bursts}</strong>
             </div>
           ))}
         </div>
@@ -347,6 +434,7 @@ function App() {
                   <th>Duration</th>
                   <th>Avg dB</th>
                   <th>Peak dB</th>
+                  <th>Bursts</th>
                 </tr>
               </thead>
               <tbody>
@@ -357,6 +445,7 @@ function App() {
                     <td>{formatDuration(event.durationSeconds)}</td>
                     <td>{event.averageDb.toFixed(1)}</td>
                     <td>{event.peakDb.toFixed(1)}</td>
+                    <td>{event.burstCount}</td>
                   </tr>
                 ))}
               </tbody>
